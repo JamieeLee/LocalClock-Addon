@@ -1,7 +1,7 @@
 ## Interface: 11200
 ## Title: LocalClock
 ## Notes: A movable clock with configurable timezone and blinking colon.
-## Author: Community addon
+## Author: JamieLinux
 ## Version: 1.0.5
 ## SavedVariables: LocalClockDB
 
