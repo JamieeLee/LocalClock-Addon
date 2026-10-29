@@ -1,6 +1,6 @@
--- LocalClock 1.0.5 for the legacy Azeroth Survivors client (Lua 5.0 style).
+-- LocalClock 1.0.8 for the legacy Azeroth Survivors client (Lua 5.0 style).
 -- The game exposes UTC through date("*t") but not the os library, so named
--- US time zones are converted from UTC. US DST transitions are calculated.
+-- time zones are converted from UTC. US and EU DST transitions are calculated.
 
 local frame
 local label
@@ -9,7 +9,6 @@ local shown = true
 local colonVisible = true
 local moveUIOwnsClock = false
 local ownershipCheckElapsed = 0
-
 local zones = {
     eastern  = { standard = -5, dst = true,  label = "Eastern" },
     central  = { standard = -6, dst = true,  label = "Central" },
@@ -18,9 +17,9 @@ local zones = {
     alaska   = { standard = -9, dst = true,  label = "Alaska" },
     hawaii   = { standard = -10, dst = false, label = "Hawaii" },
     arizona  = { standard = -7, dst = false, label = "Arizona" },
-    utc      = { standard = 0, dst = false, label = "UTC" }
+    utc      = { standard = 0, dst = false, label = "UTC" },
+    eet      = { standard = 2, dst = true, label = "EET" }
 }
-
 local function Mod(a, b)
     return a - math.floor(a / b) * b
 end
@@ -49,6 +48,17 @@ local function FirstSunday(year, month, current)
     return 1 + Mod(1 - firstWday, 7)
 end
 
+local function LastSunday(year, month, current)
+    -- Compute the last Sunday of the month using the current UTC date's
+    -- weekday. This avoids os.time/os.date, which this client does not expose.
+    local firstWday = current.wday - (current.day - 1)
+    while firstWday < 1 do firstWday = firstWday + 7 end
+    while firstWday > 7 do firstWday = firstWday - 7 end
+    local lastDay = DaysInMonth(year, month)
+    local lastWday = 1 + Mod((firstWday - 1) + (lastDay - 1), 7)
+    return lastDay - Mod(lastWday - 1, 7)
+end
+
 local function IsUSDaylightTime(t)
     if not t.month or not t.day or not t.hour or not t.wday then return false end
     if t.month < 3 or t.month > 11 then return false end
@@ -61,11 +71,28 @@ local function IsUSDaylightTime(t)
         if t.day < second then return false end
         return t.hour >= 7 -- 02:00 EST = 07:00 UTC
     end
-
     local first = FirstSunday(t.year, 11, t)
     if t.day < first then return true end
     if t.day > first then return false end
     return t.hour < 6 -- 02:00 EDT = 06:00 UTC
+end
+
+local function IsEuropeanDaylightTime(t)
+    if not t.year or not t.month or not t.day or not t.hour or not t.wday then return false end
+    if t.month < 3 or t.month > 10 then return false end
+    if t.month > 3 and t.month < 10 then return true end
+
+    if t.month == 3 then
+        local last = LastSunday(t.year, 3, t)
+        if t.day < last then return false end
+        if t.day > last then return true end
+        return t.hour >= 1 -- EU summer time starts at 01:00 UTC
+    end
+
+    local last = LastSunday(t.year, 10, t)
+    if t.day < last then return true end
+    if t.day > last then return false end
+    return t.hour < 1 -- EU summer time ends at 01:00 UTC
 end
 
 local function GetOffset(t)
@@ -73,8 +100,20 @@ local function GetOffset(t)
     if LocalClockDB and LocalClockDB.zone then zoneName = LocalClockDB.zone end
     local zone = zones[zoneName] or zones.eastern
     local offset = zone.standard
-    if zone.dst and IsUSDaylightTime(t) then offset = offset + 1 end
-    return offset, zone.label
+    local zoneLabel = zone.label
+    if zone.dst then
+        if zoneName == "eet" then
+            if IsEuropeanDaylightTime(t) then
+                offset = offset + 1
+                zoneLabel = "EEST"
+            else
+                zoneLabel = "EET"
+            end
+        elseif IsUSDaylightTime(t) then
+            offset = offset + 1
+        end
+    end
+    return offset, zoneLabel
 end
 
 local function ShiftDate(t, offset)
@@ -111,7 +150,6 @@ local function GetClockText()
     local minute = t.min
     local colon = ":"
     if not colonVisible then colon = " " end
-
     if LocalClockDB and LocalClockDB.use12Hour then
         local suffix = "AM"
         if hour >= 12 then suffix = "PM" end
@@ -192,7 +230,6 @@ local function CreateClock()
     frame:EnableMouse(true)
     frame:RegisterForDrag("LeftButton")
     frame:SetClampedToScreen(true)
-
     if frame.SetBackdrop then
         frame:SetBackdrop({
             bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -205,7 +242,6 @@ local function CreateClock()
     label = frame:CreateFontString("LocalClockText", "OVERLAY", "GameFontNormal")
     label:SetPoint("CENTER", frame, "CENTER", 0, 0)
     label:SetTextColor(1, 0.9, 0.65)
-
     frame:SetScript("OnDragStart", function()
         if not moveUIOwnsClock and frame.StartMoving then frame:StartMoving() end
     end)
@@ -228,7 +264,6 @@ local function CreateClock()
             UpdateClock()
         end
     end)
-
     RestorePosition()
     UpdateDragOwnership()
     UpdateClock()
@@ -239,7 +274,6 @@ SLASH_LOCALCLOCK2 = "/clock"
 SlashCmdList["LOCALCLOCK"] = function(message)
     local command = string.lower(message or "")
     local zoneArg = string.gsub(command, "^zone%s+", "")
-
     if command == "hide" then
         SetShown(false)
         Print("hidden. Use /clock show to display it.")
@@ -258,18 +292,46 @@ SlashCmdList["LOCALCLOCK"] = function(message)
         UpdateClock()
         Print("using 24-hour time.")
     elseif string.find(command, "^zone%s+") then
+        if zoneArg == "eastern european" or zoneArg == "eastern-european" or zoneArg == "european" then
+            zoneArg = "eet"
+        end
         if zones[zoneArg] then
             LocalClockDB.zone = zoneArg
             UpdateClock()
-            Print("time zone set to " .. zones[zoneArg].label .. ".")
+            if zoneArg == "eet" then
+                local ok, t = pcall(date, "*t")
+                if ok and type(t) == "table" then
+                    local offset, activeLabel = GetOffset(t)
+                    local sign = ""
+                    if offset >= 0 then sign = "+" end
+                    Print("time zone set to " .. activeLabel .. " (UTC" .. sign .. tostring(offset) .. "); switches automatically between EET and EEST.")
+                else
+                    Print("time zone set to EET/EEST; switches automatically for European summer time.")
+                end
+            else
+                Print("time zone set to " .. zones[zoneArg].label .. ".")
+            end
         else
-            Print("unknown zone. Options: eastern, central, mountain, pacific, alaska, arizona, hawaii, utc.")
-            Print("example: /clock zone eastern")
+            Print("unknown zone. Options: eastern, central, mountain, pacific, alaska, arizona, hawaii, utc, eet.")
+            Print("example: /clock zone eet (automatically switches between EET and EEST)")
         end
     elseif command == "zone" then
         local current = LocalClockDB.zone or "eastern"
-        Print("current zone: " .. (zones[current] and zones[current].label or "Eastern") .. ".")
-        Print("set with /clock zone eastern, central, mountain, pacific, alaska, arizona, hawaii, or utc.")
+        if current == "eet" then
+            local ok, t = pcall(date, "*t")
+            if ok and type(t) == "table" then
+                local offset, activeLabel = GetOffset(t)
+                local sign = ""
+                if offset >= 0 then sign = "+" end
+                Print("current zone: " .. activeLabel .. " (UTC" .. sign .. tostring(offset) .. ").")
+            else
+                Print("current zone: EET/EEST.")
+            end
+            Print("EET/EEST switches automatically for European summer time.")
+        else
+            Print("current zone: " .. (zones[current] and zones[current].label or "Eastern") .. ".")
+        end
+        Print("set with /clock zone eastern, central, mountain, pacific, alaska, arizona, hawaii, utc, or eet.")
     elseif command == "reset" then
         LocalClockDB.point = nil
         LocalClockDB.relativePoint = nil
@@ -296,8 +358,8 @@ SlashCmdList["LOCALCLOCK"] = function(message)
     else
         Print("drag the clock with the left mouse button to move it.")
         Print("commands: /clock show, hide, toggle, 12h, 24h, reset, debug")
-        Print("time zones: /clock zone eastern (or central, mountain, pacific, alaska, arizona, hawaii, utc)")
-        Print("US DST is calculated automatically for Eastern, Central, Mountain, Pacific, and Alaska.")
+        Print("time zones: /clock zone eastern, central, mountain, pacific, alaska, arizona, hawaii, utc, eet")
+        Print("US and EU daylight-saving transitions are calculated automatically for zones that observe them.")
     end
 end
 
