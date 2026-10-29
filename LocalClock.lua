@@ -7,6 +7,8 @@ local label
 local elapsed = 0
 local shown = true
 local colonVisible = true
+local moveUIOwnsClock = false
+local ownershipCheckElapsed = 0
 
 local zones = {
     eastern  = { standard = -5, dst = true,  label = "Eastern" },
@@ -157,6 +159,29 @@ local function SetShown(value)
     end
 end
 
+-- Move UI owns positioning after its addon has initialized and registered this frame.
+-- Keep standalone dragging available when Move UI is absent.
+local function UpdateDragOwnership()
+    local useMoveUI = MoveAnything_InitRun and MoveAnything_FindFrame and
+        MoveAnything_FindFrame("LocalClockFrame") ~= nil
+    if useMoveUI == moveUIOwnsClock then return end
+    moveUIOwnsClock = useMoveUI
+    if not frame then return end
+    if moveUIOwnsClock then
+        frame:SetScript("OnDragStart", function() end)
+        frame:SetScript("OnDragStop", function() end)
+        Print("Move UI detected; clock positioning is controlled by Move UI.")
+    else
+        frame:SetScript("OnDragStart", function()
+            if frame.StartMoving then frame:StartMoving() end
+        end)
+        frame:SetScript("OnDragStop", function()
+            if frame.StopMovingOrSizing then frame:StopMovingOrSizing() end
+            SavePosition()
+        end)
+    end
+end
+
 local function CreateClock()
     if frame then return end
     frame = CreateFrame("Frame", "LocalClockFrame", UIParent)
@@ -182,14 +207,21 @@ local function CreateClock()
     label:SetTextColor(1, 0.9, 0.65)
 
     frame:SetScript("OnDragStart", function()
-        if frame.StartMoving then frame:StartMoving() end
+        if not moveUIOwnsClock and frame.StartMoving then frame:StartMoving() end
     end)
     frame:SetScript("OnDragStop", function()
-        if frame.StopMovingOrSizing then frame:StopMovingOrSizing() end
-        SavePosition()
+        if not moveUIOwnsClock then
+            if frame.StopMovingOrSizing then frame:StopMovingOrSizing() end
+            SavePosition()
+        end
     end)
     frame:SetScript("OnUpdate", function()
-        elapsed = elapsed + arg1
+        ownershipCheckElapsed = ownershipCheckElapsed + (arg1 or 0)
+        if ownershipCheckElapsed >= 1 then
+            ownershipCheckElapsed = 0
+            UpdateDragOwnership()
+        end
+        elapsed = elapsed + (arg1 or 0)
         if elapsed >= 0.5 then
             elapsed = elapsed - 0.5
             colonVisible = not colonVisible
@@ -198,6 +230,7 @@ local function CreateClock()
     end)
 
     RestorePosition()
+    UpdateDragOwnership()
     UpdateClock()
 end
 

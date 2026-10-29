@@ -2,7 +2,7 @@
 ## Title: LocalClock
 ## Notes: A movable clock with configurable timezone and blinking colon.
 ## Author: JamieLinux
-## Version: 1.0.5
+## Version: 1.0.6
 ## SavedVariables: LocalClockDB
 
 LocalClock.lua
