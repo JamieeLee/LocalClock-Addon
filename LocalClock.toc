@@ -1,8 +1,8 @@
 ## Interface: 11200
 ## Title: LocalClock
-## Notes: A movable clock with configurable timezone and blinking colon; includes EET/EEST.
+## Notes: Dual clock with independently movable clock, stopwatch, and alarm countdown modes.
 ## Author: JamieLinux
-## Version: 1.0.8
+## Version: 1.3.3
 ## SavedVariables: LocalClockDB
 
 LocalClock.lua
