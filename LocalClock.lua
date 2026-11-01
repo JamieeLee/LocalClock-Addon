@@ -1,6 +1,6 @@
--- LocalClock 1.3.1 for the legacy Azeroth Survivors client (Lua 5.0 style).
--- The game exposes UTC through date("*t") but not the os library, so named
--- time zones are converted from UTC. US and EU DST transitions are calculated.
+-- LocalClock 1.3.2 for the legacy Azeroth Survivors client (Lua 5.0 style).
+-- Uses the game's device-local clock API where available; named/custom zones
+-- retain the UTC-based conversion engine and US/EU daylight-saving rules.
 
 local frame
 local label
@@ -10,10 +10,13 @@ local colonVisible = true
 local moveUIOwnsClock = false
 local moveUIRegistered = false
 local minimapVisible = true
-local showWhileMinimapHidden = false
+local gameClockShown = true
+local nativeClockFrame
+local minimapButton
 local watcher
 local watcherElapsed = 0
 local zones = {
+    ["local"] = { standard = 0, dst = false, label = "Game Local Time" },
     eastern  = { standard = -5, dst = true,  label = "Eastern" },
     central  = { standard = -6, dst = true,  label = "Central" },
     mountain = { standard = -7, dst = true,  label = "Mountain" },
@@ -43,8 +46,9 @@ local fallbackAlarmFrame
 local fallbackAlarmText
 local fallbackAlarmRemaining = 0
 local MIN_OFFSET, MAX_OFFSET = -12, 14
-local zoneOrder = { "eastern", "central", "mountain", "pacific", "alaska", "arizona", "hawaii", "utc", "cet", "eet" }
+local zoneOrder = { "local", "eastern", "central", "mountain", "pacific", "alaska", "arizona", "hawaii", "utc", "cet", "eet" }
 local menu
+local localClockMenuOpensLeft = false
 local function Mod(a, b)
     return a - math.floor(a / b) * b
 end
@@ -122,9 +126,74 @@ local function IsEuropeanDaylightTime(t)
     return t.hour < 1 -- EU summer time ends at 01:00 UTC
 end
 
+-- Azeroth Survivors 0.136.0 exposes the same device-local clock used by
+-- the native minimap widget. Read it as a snapshot; never infer the device
+-- time zone from the realm clock or the UTC date API.
+local function ReadGameLocalTime()
+    if type(AZS_GetLocalTime) ~= "function" then return nil end
+    -- Support both the table snapshot and four-value Lua return shape. The
+    -- public changelog describes the returned fields but not their container.
+    local ok, first, second, third, fourth = pcall(AZS_GetLocalTime)
+    if not ok then return nil end
+
+    local reading
+    if type(first) == "table" then
+        reading = first
+    elseif type(first) == "string" then
+        reading = {
+            text = first,
+            hour = second,
+            minute = third,
+            is24Hour = fourth
+        }
+    else
+        return nil
+    end
+
+    -- The changelog describes a format value without pinning its Lua type.
+    -- Accept the documented boolean as well as common textual format labels.
+    local formatValue = reading.is24Hour
+    if formatValue == nil then formatValue = reading.format end
+    if type(formatValue) == "string" then
+        local normalized = string.lower(formatValue)
+        if normalized == "24" or normalized == "24h" or normalized == "24-hour" or normalized == "24hour" then
+            formatValue = true
+        elseif normalized == "12" or normalized == "12h" or normalized == "12-hour" or normalized == "12hour" then
+            formatValue = false
+        else
+            return nil
+        end
+    end
+
+    if type(reading.text) ~= "string" or type(reading.hour) ~= "number" or
+        type(reading.minute) ~= "number" or type(formatValue) ~= "boolean" then
+        return nil
+    end
+    if reading.hour < 0 or reading.hour > 23 or reading.minute < 0 or reading.minute > 59 then
+        return nil
+    end
+    return {
+        text = reading.text,
+        hour = reading.hour,
+        minute = reading.minute,
+        is24Hour = formatValue
+    }
+end
+
+local function NormalizeGameClockShown(value)
+    if value == true or value == 1 or value == "1" then return true end
+    if value == false or value == 0 or value == "0" then return false end
+    return nil
+end
+
 local function GetOffset(t)
     local zoneName = "eastern"
     if LocalClockDB and LocalClockDB.zone then zoneName = LocalClockDB.zone end
+    if zoneName == "local" then
+        if ReadGameLocalTime() then return 0, "Device Local Time" end
+        -- Older clients without the getter retain the previous Eastern fallback.
+        zoneName = "eastern"
+    end
     if zoneName == "custom" then
         local o = (LocalClockDB and LocalClockDB.customOffset) or 0
         if o == 0 then return 0, "UTC" end
@@ -171,7 +240,61 @@ local function ShiftDate(t, offset)
     return year, month, day, hour
 end
 
+local function GetGameLocalHour24(reading)
+    if not reading then return 0 end
+    local hour = reading.hour or 0
+
+    -- A 24-hour source is already normalized. Some clients may expose a
+    -- 12-hour numeric hour (1-12) alongside a formatted string such as
+    -- "1:41 PM"; convert that numeric value when the user requests 24-hour.
+    if reading.is24Hour then return hour end
+
+    local text = string.lower(reading.text or "")
+    local isPM = string.find(text, "p%.?m%.?")
+    local isAM = string.find(text, "a%.?m%.?")
+
+    if isPM then
+        if hour < 12 then hour = hour + 12 end
+    elseif isAM then
+        if hour == 12 then hour = 0 end
+    end
+
+    -- If the API already returned 13-23 despite using a 12-hour display
+    -- string, leave it untouched. This also safely handles clients whose
+    -- numeric hour is already 24-hour even when their text is localized.
+    return hour
+end
+
 local function GetClockText()
+    local zoneName = LocalClockDB and LocalClockDB.zone or "eastern"
+
+    if zoneName == "local" then
+        local reading = ReadGameLocalTime()
+        if reading then
+            local formatMode = LocalClockDB and LocalClockDB.localFormat or "game"
+            if formatMode == "game" then
+                -- Use the game's exact language-aware string (English 12h,
+                -- other localized formats 24h) without reformatting it.
+                return reading.text
+            end
+
+            local hour = reading.hour
+            local minute = reading.minute
+            local colon = colonVisible and ":" or " "
+            if formatMode == "12h" then
+                local hour24 = GetGameLocalHour24(reading)
+                local suffix = (hour24 >= 12) and "PM" or "AM"
+                hour = Mod(hour24, 12)
+                if hour == 0 then hour = 12 end
+                return string.format("%d%s%02d %s", hour, colon, minute, suffix)
+            end
+            hour = GetGameLocalHour24(reading)
+            return string.format("%02d%s%02d", hour, colon, minute)
+        end
+        -- If the API is temporarily unavailable, preserve a usable clock.
+        -- GetOffset() supplies the legacy Eastern fallback in that case.
+    end
+
     if not date then return "-- -- --" end
     local ok, t = pcall(date, "*t")
     if not ok or type(t) ~= "table" or not t.hour or not t.min then return "-- -- --" end
@@ -186,9 +309,20 @@ local function GetClockText()
         if hour >= 12 then suffix = "PM" end
         hour = Mod(hour, 12)
         if hour == 0 then hour = 12 end
-        return string.format("%02d%s%02d %s", hour, colon, minute, suffix)
+        return string.format("%d%s%02d %s", hour, colon, minute, suffix)
     end
     return string.format("%02d%s%02d", hour, colon, minute)
+end
+
+local function IsClockUsing12Hour()
+    if LocalClockDB and LocalClockDB.zone == "local" then
+        local formatMode = LocalClockDB.localFormat or "game"
+        if formatMode == "12h" then return true end
+        if formatMode == "24h" then return false end
+        local reading = ReadGameLocalTime()
+        if reading then return not reading.is24Hour end
+    end
+    return LocalClockDB and LocalClockDB.use12Hour and true or false
 end
 
 local function FormatDuration(seconds)
@@ -221,13 +355,27 @@ local function ComputeAlarmTimestamp(hour, minute)
         return nil, "The current UTC time could not be read."
     end
 
-    -- The selected LocalClock zone is the source of truth. The native game
-    -- minimap clock is deliberately never queried.
+    -- For Game Local Time, use the game's device-local snapshot to calculate
+    -- the wall-clock interval. The native widget may be hidden; the getter
+    -- remains available independently of visibility.
+    local wallDelta
+    if LocalClockDB and LocalClockDB.zone == "local" then
+        local reading = ReadGameLocalTime()
+        if reading then
+            local localNow = (reading.hour * 3600) + (reading.minute * 60) + (utcNow.sec or 0)
+            local targetLocal = (hour * 3600) + (minute * 60)
+            wallDelta = targetLocal - localNow
+            if wallDelta <= 0 then wallDelta = wallDelta + 86400 end
+            return math.floor(now + wallDelta + 0.5)
+        end
+    end
+
+    -- Named/custom time zones continue using LocalClock's existing UTC/DST engine.
     local currentOffset = GetOffset(utcNow)
     local _, _, _, localHour = ShiftDate(utcNow, currentOffset)
     local localNow = (localHour * 3600) + ((utcNow.min or 0) * 60) + (utcNow.sec or 0)
     local targetLocal = (hour * 3600) + (minute * 60)
-    local wallDelta = targetLocal - localNow
+    wallDelta = targetLocal - localNow
     if wallDelta <= 0 then wallDelta = wallDelta + 86400 end
 
     local targetOffset = currentOffset
@@ -439,7 +587,6 @@ UpdateClock = function()
     if UpdateToolsPanel then UpdateToolsPanel() end
 end
 
-local nativeClockFrame
 local appliedMinimapScale = 1
 
 local function GetMinimapContainer()
@@ -451,6 +598,85 @@ local function GetMinimapContainer()
     return UIParent
 end
 
+local function GetGameClockShown()
+    -- Prefer the documented HUD API when the query function is present.
+    if type(AZS_IsHudShown) == "function" then
+        local ok, value = pcall(AZS_IsHudShown, "localClock")
+        if ok then
+            local normalized = NormalizeGameClockShown(value)
+            if normalized ~= nil then
+                gameClockShown = normalized
+                return normalized
+            end
+        end
+    end
+
+    -- The saved hudLocalClock CVar is the documented preference backing this
+    -- part. Preserve false explicitly; never use an and/or pseudo-ternary here.
+    if type(GetCVar) == "function" then
+        local ok, value = pcall(GetCVar, "hudLocalClock")
+        if ok then
+            local normalized = NormalizeGameClockShown(value)
+            if normalized ~= nil then
+                gameClockShown = normalized
+                return normalized
+            end
+        end
+    end
+    return gameClockShown
+end
+
+local function ApplyNativeClockFrameVisibility()
+    if nativeClockFrame then
+        if minimapVisible and GetGameClockShown() then
+            nativeClockFrame:Show()
+        else
+            nativeClockFrame:Hide()
+        end
+    end
+    if minimapButton then
+        if minimapVisible then minimapButton:Show() else minimapButton:Hide() end
+    end
+end
+
+local function SetGameClockShown(value)
+    value = value and true or false
+
+    -- Prefer the dedicated HUD API. Do not require the getter or time getter
+    -- to exist: the visibility setter is an independent capability.
+    if type(AZS_SetHudShown) == "function" then
+        local ok, err = pcall(AZS_SetHudShown, "localClock", value)
+        if ok then
+            gameClockShown = value
+            ApplyNativeClockFrameVisibility()
+            return true
+        end
+        -- If the wrapper exists but errors, attempt the documented CVar path.
+        if type(SetCVar) ~= "function" then
+            if Print then Print("Could not change the native Game Clock: " .. tostring(err)) end
+            return false
+        end
+    end
+
+    -- The game documents hudLocalClock as the saved preference backing the
+    -- localClock HUD part. This fallback also covers builds that expose the
+    -- CVar but omit one of the Lua query/setter wrappers.
+    if type(SetCVar) == "function" then
+        local cvarValue = value and "1" or "0"
+        local ok, err = pcall(SetCVar, "hudLocalClock", cvarValue)
+        if ok then
+            gameClockShown = value
+            ApplyNativeClockFrameVisibility()
+            return true
+        end
+        if Print then Print("Could not change the native Game Clock: " .. tostring(err)) end
+        return false
+    end
+
+    if Print then Print("Native Game Clock visibility controls are unavailable in this client build.") end
+    return false
+end
+
 local function GetMoveUIScaleMultiplier()
     if MoveAnything_FrameOptions then
         local opt = MoveAnything_FrameOptions["LocalClockDisplayFrame"]
@@ -459,12 +685,38 @@ local function GetMoveUIScaleMultiplier()
     return 1
 end
 
+-- Resize the native clock surround from the exact string supplied by the
+-- game's local-time API. Avoid traversing the minimap frame tree here: some
+-- client builds expose protected/atypical frame regions during PLAYER_LOGIN.
+local function UpdateNativeClockFrameSize()
+    if not nativeClockFrame then return end
+
+    local ok, reading = pcall(ReadGameLocalTime)
+    if not ok or type(reading) ~= "table" or
+        type(reading.text) ~= "string" or reading.text == "" then
+        return
+    end
+
+    -- Approximate the native font's average glyph width, then add a stable
+    -- 6px margin on each side. The value follows 12h/24h and localized text
+    -- lengths while avoiding dependence on private minimap child regions.
+    local desiredWidth = math.ceil((string.len(reading.text) * 5.2) + 12)
+    if desiredWidth < 40 then desiredWidth = 40 end
+
+    local widthOK, currentWidth = pcall(nativeClockFrame.GetWidth, nativeClockFrame)
+    if not widthOK or type(currentWidth) ~= "number" then return end
+    if math.abs(currentWidth - desiredWidth) >= 1 then
+        pcall(nativeClockFrame.SetWidth, nativeClockFrame, desiredWidth)
+    end
+end
+
 local function CreateNativeClockFrame()
     if nativeClockFrame then return end
     local parent = GetMinimapContainer()
     nativeClockFrame = CreateFrame("Frame", "LocalClockNativeFrame", parent)
-    -- Tighten the surround slightly so it hugs the client's clock label.
-    nativeClockFrame:SetWidth(56)
+    -- Start at a compact width; UpdateNativeClockFrameSize() measures the
+    -- actual native time label and resizes this surround as the text changes.
+    nativeClockFrame:SetWidth(46)
     nativeClockFrame:SetHeight(19)
     nativeClockFrame:SetFrameStrata("HIGH")
     if nativeClockFrame.SetBackdrop then
@@ -484,8 +736,9 @@ local function CreateNativeClockFrame()
     else
         nativeClockFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 120)
     end
-    -- This frame belongs to the minimap and is never toggled with LocalClock.
-    nativeClockFrame:Show()
+    -- This surround mirrors the native Game Clock preference, but remains a
+    -- separate addon frame so the border never obscures the game's text.
+    ApplyNativeClockFrameVisibility()
 end
 
 local function UpdateMinimapScale()
@@ -604,7 +857,7 @@ end
 
 local function ApplyClockVisibility()
     if not frame then return end
-    local shouldShow = shown and (minimapVisible or showWhileMinimapHidden) and not MoveUIHidesLocalClock()
+    local shouldShow = shown and minimapVisible and not MoveUIHidesLocalClock()
     SetFrameActualShown(frame, shouldShow)
     if shouldShow then UpdateClock() end
 end
@@ -613,25 +866,13 @@ end
 function LocalClock_OnMoveUIVisibilityChanged(visible)
     shown = visible and true or false
     if LocalClockDB then LocalClockDB.shown = shown end
-    if shown and not minimapVisible then
-        -- An explicit Show of LocalClock is allowed to display it without the minimap.
-        showWhileMinimapHidden = true
-    elseif not shown then
-        showWhileMinimapHidden = false
-    end
     ApplyClockVisibility()
 end
 
 -- Called by Move UI when MinimapCluster itself is hidden or shown.
 function LocalClock_OnMinimapVisibilityChanged(visible)
     minimapVisible = visible and true or false
-    -- A LocalClock display explicitly shown while the minimap is hidden is
-    -- allowed to stand alone only until the next minimap visibility change.
-    showWhileMinimapHidden = false
-
-    if nativeClockFrame then
-        if minimapVisible then nativeClockFrame:Show() else nativeClockFrame:Hide() end
-    end
+    ApplyNativeClockFrameVisibility()
 
     if MoveAnything_FrameOptions then
         local opt = MoveAnything_FrameOptions["LocalClockDisplayFrame"]
@@ -657,12 +898,6 @@ end
 local function SetShown(value)
     shown = value and true or false
     if LocalClockDB then LocalClockDB.shown = shown end
-    if shown and not minimapVisible then
-        showWhileMinimapHidden = true
-    elseif not shown then
-        showWhileMinimapHidden = false
-    end
-
     if moveUIRegistered and frame then
         local opt = MoveAnything_FrameOptions and MoveAnything_FrameOptions["LocalClockDisplayFrame"]
         if opt then opt.minimapSuppressed = nil end
@@ -781,9 +1016,7 @@ local function UpdateMinimapVisibility()
         LocalClock_OnMinimapVisibilityChanged(visible)
     else
         ApplyClockVisibility()
-        if nativeClockFrame then
-            if visible then nativeClockFrame:Show() else nativeClockFrame:Hide() end
-        end
+        ApplyNativeClockFrameVisibility()
     end
 end
 
@@ -809,6 +1042,9 @@ local function StartWatcher()
             UpdateDragOwnership()
             UpdateMinimapScale()
             UpdateMinimapVisibility()
+            -- Resizing is best-effort and must never interrupt the main clock.
+            pcall(UpdateNativeClockFrameSize)
+            ApplyNativeClockFrameVisibility()
         end
     end)
 end
@@ -823,13 +1059,69 @@ local function AddMenuButton(info)
     if UIDropDownMenu_AddButton then UIDropDownMenu_AddButton(info, info.level) end
 end
 
+local function RefreshMenuToggle(value, checked)
+    if not getglobal then return end
+    local level
+    for level = 1, 4 do
+        local i
+        for i = 1, 24 do
+            local button = getglobal("DropDownList" .. level .. "Button" .. i)
+            if button and button.value == value then
+                button.checked = checked and 1 or nil
+                local buttonName = button:GetName()
+                local check = getglobal(buttonName .. "Check")
+                if check then
+                    -- In the legacy dropdown template the checkmark is a
+                    -- Texture, not a CheckButton; Show/Hide is the reliable
+                    -- way to refresh it without closing the dropdown.
+                    if checked then
+                        if check.Show then check:Show() end
+                    else
+                        if check.Hide then check:Hide() end
+                    end
+                    if check.SetChecked then check:SetChecked(checked and 1 or 0) end
+                end
+                if button.checkButton and button.checkButton.SetChecked then
+                    button.checkButton:SetChecked(checked and 1 or 0)
+                end
+            end
+        end
+    end
+end
+
+local menuToggleRefreshFrame
+local pendingMenuToggleValue
+local pendingMenuToggleChecked
+
+local function QueueMenuToggleRefresh(value, checked)
+    pendingMenuToggleValue = value
+    pendingMenuToggleChecked = checked and true or false
+
+    if not menuToggleRefreshFrame then
+        menuToggleRefreshFrame = CreateFrame("Frame", "LocalClockMenuToggleRefresh", UIParent)
+    end
+
+    menuToggleRefreshFrame:SetScript("OnUpdate", function()
+        -- Run once, after UIDropDownMenuButton_OnClick has completed its own
+        -- checked-state processing for the current mouse click.
+        menuToggleRefreshFrame:SetScript("OnUpdate", nil)
+        local refreshValue = pendingMenuToggleValue
+        local refreshChecked = pendingMenuToggleChecked
+        pendingMenuToggleValue = nil
+        pendingMenuToggleChecked = nil
+        if refreshValue then
+            RefreshMenuToggle(refreshValue, refreshChecked)
+        end
+    end)
+end
+
 local function InitMenu(level)
     level = level or UIDROPDOWNMENU_MENU_LEVEL or 1
     local db = LocalClockDB or {}
     local info
 
     if level == 2 and UIDROPDOWNMENU_MENU_VALUE == "ZONE" then
-        local current = db.zone or "eastern"
+        local current = db.zone or "local"
         for _, key in ipairs(zoneOrder) do
             local zoneKey = key
             local z = zones[zoneKey]
@@ -847,47 +1139,116 @@ local function InitMenu(level)
     AddMenuButton({ level = 1, text = "LocalClock", isTitle = 1, notCheckable = 1 })
     AddMenuButton({ level = 1, text = "Time zone settings...", notCheckable = 1,
         func = function() RunCommand("options") end })
-    AddMenuButton({ level = 1, text = "Stopwatch & alarm...", notCheckable = 1,
-        func = function() RunCommand("tools") end })
+    AddMenuButton({ level = 1, text = "Clock...", notCheckable = 1,
+        func = function()
+            CreateToolsPanel()
+            SetDisplayMode("clock")
+            toolsPanel:Show()
+        end })
+    AddMenuButton({ level = 1, text = "Stopwatch...", notCheckable = 1,
+        func = function()
+            CreateToolsPanel()
+            SetDisplayMode("stopwatch")
+            toolsPanel:Show()
+        end })
+    AddMenuButton({ level = 1, text = "Alarm...", notCheckable = 1,
+        func = function()
+            CreateToolsPanel()
+            SetDisplayMode("alarm")
+            toolsPanel:Show()
+        end })
     AddMenuButton({ level = 1, text = "Time zone", hasArrow = 1, value = "ZONE", notCheckable = 1 })
-    AddMenuButton({ level = 1, text = "12-hour", checked = db.use12Hour and 1 or nil,
+    AddMenuButton({ level = 1, text = "12-hour", checked = IsClockUsing12Hour() and 1 or nil,
         func = function() RunCommand("12h") end })
-    AddMenuButton({ level = 1, text = "24-hour", checked = (not db.use12Hour) and 1 or nil,
+    AddMenuButton({ level = 1, text = "24-hour", checked = (not IsClockUsing12Hour()) and 1 or nil,
         func = function() RunCommand("24h") end })
     AddMenuButton({ level = 1, text = "Lock position", checked = db.locked and 1 or nil,
         func = function() RunCommand(db.locked and "unlock" or "lock") end })
     AddMenuButton({ level = 1, text = "Reset position", notCheckable = 1,
         func = function() RunCommand("reset") end })
-    AddMenuButton({ level = 1, value = "LOCALCLOCK_VISIBILITY_TOGGLE",
-        text = shown and "Hide LocalClock" or "Show LocalClock", checked = shown and 1 or nil,
+    AddMenuButton({ level = 1, text = "Show Game Clock", value = "LOCALCLOCK_GAMECLOCK_TOGGLE",
+        checked = GetGameClockShown() and 1 or nil,
         keepShownOnClick = 1,
         func = function()
-            -- Do not use RunCommand here: it deliberately closes dropdowns.
-            -- This item is an in-place toggle, so keep the context menu open
-            -- and update its visible label/checkmark immediately.
-            SlashCmdList["LOCALCLOCK"]("toggle")
-            if getglobal then
-                local i
-                for i = 1, 20 do
-                    local button = getglobal("DropDownList1Button" .. i)
-                    if button and button.value == "LOCALCLOCK_VISIBILITY_TOGGLE" then
-                        local buttonName = button:GetName()
-                        local text = shown and "Hide LocalClock" or "Show LocalClock"
-                        local normalText = getglobal(buttonName .. "NormalText")
-                        local highlightText = getglobal(buttonName .. "HighlightText")
-                        local check = getglobal(buttonName .. "Check")
-                        if normalText then normalText:SetText(text) end
-                        if highlightText then highlightText:SetText(text) end
-                        if check and check.SetChecked then check:SetChecked(shown and 1 or 0) end
-                        button.checked = shown and 1 or nil
-                        button.text = text
-                        break
-                    end
-                end
-            end
+            SetGameClockShown(not GetGameClockShown())
+            QueueMenuToggleRefresh("LOCALCLOCK_GAMECLOCK_TOGGLE", GetGameClockShown())
+        end })
+    AddMenuButton({ level = 1, text = "Show LocalClock", value = "LOCALCLOCK_VISIBILITY_TOGGLE",
+        checked = shown and 1 or nil, keepShownOnClick = 1,
+        func = function()
+            SetShown(not shown)
+            QueueMenuToggleRefresh("LOCALCLOCK_VISIBILITY_TOGGLE", shown)
         end })
     AddMenuButton({ level = 1, text = "Close", notCheckable = 1,
         func = function() if CloseDropDownMenus then CloseDropDownMenus() end end })
+end
+
+local function PositionLocalClockMenu(anchorName)
+    -- Choose the root dropdown side based on the actual anchor's screen
+    -- position. Every child menu reuses this direction.
+    local anchor = getglobal and getglobal(anchorName or "LocalClockDisplayFrame")
+    local list = getglobal and getglobal("DropDownList1")
+    if not anchor or not list or not anchor.GetCenter then return end
+
+    local centerX = anchor:GetCenter()
+    local uiWidth = UIParent and UIParent.GetWidth and UIParent:GetWidth()
+    if not centerX or not uiWidth then return end
+
+    local leftSpace = centerX
+    local rightSpace = uiWidth - centerX
+    local rootWidth = list.GetWidth and list:GetWidth() or 0
+    localClockMenuOpensLeft = rightSpace < (rootWidth + 12) or leftSpace > rightSpace
+
+    list:ClearAllPoints()
+    if localClockMenuOpensLeft then
+        list:SetPoint("TOPRIGHT", anchor, "TOPLEFT", -4, 0)
+    else
+        list:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 4, 0)
+    end
+    if list.SetClampedToScreen then list:SetClampedToScreen(true) end
+end
+
+local function PositionLocalClockSubmenu(level)
+    local child = getglobal and getglobal("DropDownList" .. level)
+    local parent = getglobal and getglobal("DropDownList" .. (level - 1))
+    if not child or not parent then return end
+
+    local parentValue = UIDROPDOWNMENU_MENU_VALUE
+    local parentButton
+    local i
+    for i = 1, 24 do
+        local button = getglobal("DropDownList" .. (level - 1) .. "Button" .. i)
+        if button and parentValue and button.value == parentValue then
+            parentButton = button
+            break
+        end
+    end
+    if not parentButton then return end
+
+    child:ClearAllPoints()
+    if localClockMenuOpensLeft then
+        child:SetPoint("TOPRIGHT", parentButton, "TOPLEFT", -3, 0)
+    else
+        child:SetPoint("TOPLEFT", parentButton, "TOPRIGHT", 3, 0)
+    end
+    if child.SetClampedToScreen then child:SetClampedToScreen(true) end
+end
+
+local function HookLocalClockSubmenus()
+    if not getglobal then return end
+    local level
+    for level = 2, 4 do
+        local list = getglobal("DropDownList" .. level)
+        if list and not list.LocalClockPositionHooked and list.SetScript and list.GetScript then
+            local hookedLevel = level
+            local previousOnShow = list:GetScript("OnShow")
+            list:SetScript("OnShow", function()
+                if previousOnShow then previousOnShow() end
+                PositionLocalClockSubmenu(hookedLevel)
+            end)
+            list.LocalClockPositionHooked = true
+        end
+    end
 end
 
 local function ShowMenu(anchorName)
@@ -899,7 +1260,112 @@ local function ShowMenu(anchorName)
         menu = CreateFrame("Frame", "LocalClockMenu", UIParent, "UIDropDownMenuTemplate")
     end
     UIDropDownMenu_Initialize(menu, InitMenu, "MENU")
-    ToggleDropDownMenu(1, nil, menu, anchorName or "LocalClockDisplayFrame", 0, 0)
+    local anchor = anchorName or "LocalClockDisplayFrame"
+    if anchor == "LocalClockDisplayFrame" then
+        local button = getglobal and getglobal("LocalClockMinimapButton")
+        if button and button.IsShown and button:IsShown() then
+            anchor = "LocalClockMinimapButton"
+        end
+    end
+    ToggleDropDownMenu(1, nil, menu, anchor, 0, 0)
+    PositionLocalClockMenu(anchor)
+    HookLocalClockSubmenus()
+end
+
+-- Classic addon bubble attached to the minimap. The whole button is one
+-- named frame: its artwork, hit area, tooltip and click behavior move together.
+local function UpdateMinimapButtonPosition()
+    if not minimapButton or not Minimap then return end
+    local angle = tonumber(LocalClockDB and LocalClockDB.minimapButtonAngle) or 45
+    local radius = (Minimap:GetWidth() * 0.5) + 8
+    local radians = math.rad(angle)
+    minimapButton:ClearAllPoints()
+    minimapButton:SetPoint("CENTER", Minimap, "CENTER",
+        math.cos(radians) * radius, math.sin(radians) * radius)
+end
+
+local function SaveMinimapButtonAngle()
+    if not minimapButton or not Minimap or not minimapButton.GetCenter then return end
+    local centerX, centerY = Minimap:GetCenter()
+    local buttonX, buttonY = minimapButton:GetCenter()
+    if not centerX or not centerY or not buttonX or not buttonY then return end
+
+    -- Both frames share the minimap's coordinate space. Using the button's
+    -- final center avoids the post-drag snap caused by measuring cursor offset.
+    local angle = math.deg(math.atan2(buttonY - centerY, buttonX - centerX))
+    if LocalClockDB then LocalClockDB.minimapButtonAngle = angle end
+    UpdateMinimapButtonPosition()
+end
+
+local function CreateMinimapButton()
+    if minimapButton or not Minimap then return end
+    minimapButton = CreateFrame("Button", "LocalClockMinimapButton", Minimap)
+    minimapButton:SetWidth(32)
+    minimapButton:SetHeight(32)
+    minimapButton:SetFrameStrata("MEDIUM")
+    if minimapButton.SetFrameLevel and Minimap.GetFrameLevel then
+        minimapButton:SetFrameLevel(Minimap:GetFrameLevel() + 8)
+    end
+    minimapButton:SetMovable(true)
+    minimapButton:EnableMouse(true)
+    minimapButton:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    minimapButton:RegisterForDrag("LeftButton")
+    -- A single self-contained circular button graphic. The gold ring and
+    -- clock face are part of the same alpha-masked texture, so there is no
+    -- separate minimap background or offset tracking-border layer to misalign.
+    local icon = minimapButton:CreateTexture(nil, "ARTWORK")
+    icon:SetTexture("Interface\\AddOns\\LocalClock\\Textures\\LocalClockButton.tga")
+    icon:SetWidth(30)
+    icon:SetHeight(30)
+    icon:SetPoint("CENTER", minimapButton, "CENTER", 0, 0)
+
+    minimapButton:SetScript("OnEnter", function()
+        if not GameTooltip then return end
+        GameTooltip:SetOwner(minimapButton, "ANCHOR_LEFT")
+        GameTooltip:SetText("LocalClock")
+        GameTooltip:AddLine("Left-click: Clock tools", 1, 1, 1)
+        GameTooltip:AddLine("Right-click: Clock settings", 1, 1, 1)
+        GameTooltip:AddLine("Shift-drag: Move button around minimap", 0.75, 0.75, 0.75)
+        GameTooltip:Show()
+    end)
+    minimapButton:SetScript("OnLeave", function()
+        if GameTooltip then GameTooltip:Hide() end
+    end)
+    minimapButton:SetScript("OnMouseDown", function()
+        -- A new press starts a fresh click/drag gesture.
+        if not minimapButton.isDragging then minimapButton.draggedForClick = nil end
+    end)
+    minimapButton:SetScript("OnClick", function()
+        if minimapButton.draggedForClick then
+            minimapButton.draggedForClick = nil
+            return
+        end
+        if arg1 == "RightButton" then
+            ShowMenu("LocalClockMinimapButton")
+        elseif arg1 == "LeftButton" then
+            CreateToolsPanel()
+            toolsPanel:Show()
+        end
+    end)
+    minimapButton:SetScript("OnDragStart", function()
+        -- Shift-drag is reserved for placement so an ordinary left-click
+        -- continues to open the tools panel.
+        if IsShiftKeyDown and IsShiftKeyDown() then
+            minimapButton.isDragging = true
+            minimapButton.draggedForClick = true
+            minimapButton:StartMoving()
+        end
+    end)
+    minimapButton:SetScript("OnDragStop", function()
+        if minimapButton.isDragging then
+            minimapButton:StopMovingOrSizing()
+            minimapButton.isDragging = nil
+            SaveMinimapButtonAngle()
+        end
+    end)
+
+    UpdateMinimapButtonPosition()
+    ApplyNativeClockFrameVisibility()
 end
 
 -- "Your time" panel: big clock, UTC offset slider, 12/24 hour switch.
@@ -948,7 +1414,10 @@ UpdatePanel = function()
     local ok, t = pcall(date, "*t")
     if ok and type(t) == "table" then
         local offset, zoneLabel = GetOffset(t)
-        if LocalClockDB.zone == "custom" then
+        if LocalClockDB.zone == "local" and ReadGameLocalTime() then
+            panelZone:SetText("Game Local Time  (game-language format)")
+            offset = 0
+        elseif LocalClockDB.zone == "custom" then
             panelZone:SetText(OffsetLabel(offset))
         else
             panelZone:SetText(zoneLabel .. "  (" .. OffsetLabel(offset) .. ")")
@@ -960,7 +1429,7 @@ UpdatePanel = function()
         end
     end
     local c24, c12 = GOLD, GREY
-    if LocalClockDB.use12Hour then c24, c12 = GREY, GOLD end
+    if IsClockUsing12Hour() then c24, c12 = GREY, GOLD end
     panel24.fs:SetTextColor(c24[1], c24[2], c24[3])
     panel12.fs:SetTextColor(c12[1], c12[2], c12[3])
 end
@@ -1046,11 +1515,13 @@ local function CreatePanel()
 
     panel24 = MakeTextButton(panel, "LocalClockOptions24", "24 hours", 13, function()
         LocalClockDB.use12Hour = false
+        if LocalClockDB.zone == "local" then LocalClockDB.localFormat = "24h" end
         UpdateClock()
     end)
     panel24:SetPoint("BOTTOMRIGHT", panel, "BOTTOM", -6, 10)
     panel12 = MakeTextButton(panel, "LocalClockOptions12", "12 hours", 13, function()
         LocalClockDB.use12Hour = true
+        if LocalClockDB.zone == "local" then LocalClockDB.localFormat = "12h" end
         UpdateClock()
     end)
     panel12:SetPoint("BOTTOMLEFT", panel, "BOTTOM", 6, 10)
@@ -1132,19 +1603,59 @@ UpdateToolsPanel = function()
     end
 end
 
+local function SaveToolsPanelPosition()
+    if not toolsPanel or not LocalClockDB then return end
+    local point, relativeTo, relativePoint, x, y = toolsPanel:GetPoint(1)
+    if not point then return end
+
+    LocalClockDB.toolsPanelPoint = point
+    LocalClockDB.toolsPanelRelativePoint = relativePoint or point
+    LocalClockDB.toolsPanelX = x or 0
+    LocalClockDB.toolsPanelY = y or 0
+    LocalClockDB.toolsPanelRelativeToName = nil
+    if relativeTo and relativeTo ~= UIParent and relativeTo.GetName then
+        LocalClockDB.toolsPanelRelativeToName = relativeTo:GetName()
+    end
+end
+
+local function RestoreToolsPanelPosition()
+    if not toolsPanel then return end
+    toolsPanel:ClearAllPoints()
+
+    if LocalClockDB and LocalClockDB.toolsPanelPoint then
+        local relativeTo = UIParent
+        if LocalClockDB.toolsPanelRelativeToName and getglobal then
+            relativeTo = getglobal(LocalClockDB.toolsPanelRelativeToName) or UIParent
+        end
+        toolsPanel:SetPoint(
+            LocalClockDB.toolsPanelPoint,
+            relativeTo,
+            LocalClockDB.toolsPanelRelativePoint or LocalClockDB.toolsPanelPoint,
+            LocalClockDB.toolsPanelX or 0,
+            LocalClockDB.toolsPanelY or 0
+        )
+    else
+        -- Preserve the existing default for first-time installations.
+        toolsPanel:SetPoint("CENTER", UIParent, "CENTER", 0, -150)
+    end
+end
+
 CreateToolsPanel = function()
     if toolsPanel then return end
     toolsPanel = CreateFrame("Frame", "LocalClockToolsPanel", UIParent)
     toolsPanel:SetWidth(292)
     toolsPanel:SetHeight(190)
-    toolsPanel:SetPoint("CENTER", UIParent, "CENTER", 0, -150)
+    RestoreToolsPanelPosition()
     toolsPanel:SetFrameStrata("DIALOG")
     toolsPanel:SetMovable(true)
     toolsPanel:EnableMouse(true)
     toolsPanel:RegisterForDrag("LeftButton")
     toolsPanel:SetClampedToScreen(true)
     toolsPanel:SetScript("OnDragStart", function() toolsPanel:StartMoving() end)
-    toolsPanel:SetScript("OnDragStop", function() toolsPanel:StopMovingOrSizing() end)
+    toolsPanel:SetScript("OnDragStop", function()
+        toolsPanel:StopMovingOrSizing()
+        SaveToolsPanelPosition()
+    end)
     toolsPanel:SetScript("OnShow", function() UpdateToolsPanel() end)
     if toolsPanel.SetBackdrop then
         toolsPanel:SetBackdrop({
@@ -1299,12 +1810,15 @@ local function CreateClock()
         end
     end)
     frame:SetScript("OnMouseUp", function()
-        if arg1 == "RightButton" then TogglePanel() end
+        if arg1 == "RightButton" then ShowMenu("LocalClockDisplayFrame") end
     end)
 
     RestorePosition()
     UpdateMinimapScale()
     UpdateDragOwnership()
+    -- Initial sizing happens after LocalClock's own display has been created.
+    pcall(UpdateNativeClockFrameSize)
+    CreateMinimapButton()
     StartWatcher()
     UpdateMinimapVisibility()
     ApplyClockVisibility()
@@ -1357,10 +1871,12 @@ SlashCmdList["LOCALCLOCK"] = function(message)
         Print("alarm cleared.")
     elseif command == "12h" then
         LocalClockDB.use12Hour = true
+        if LocalClockDB.zone == "local" then LocalClockDB.localFormat = "12h" end
         UpdateClock()
         Print("using 12-hour time.")
     elseif command == "24h" then
         LocalClockDB.use12Hour = false
+        if LocalClockDB.zone == "local" then LocalClockDB.localFormat = "24h" end
         UpdateClock()
         Print("using 24-hour time.")
     elseif string.find(command, "^zone%s+") then
@@ -1373,7 +1889,9 @@ SlashCmdList["LOCALCLOCK"] = function(message)
             LocalClockDB.zone = zoneArg
             RefreshAlarmForZoneChange()
             UpdateClock()
-            if zones[zoneArg].eu then
+            if zoneArg == "local" then
+                Print("time zone set to Game Local Time; the game language controls the default 12/24-hour format.")
+            elseif zones[zoneArg].eu then
                 local ok, t = pcall(date, "*t")
                 if ok and type(t) == "table" then
                     local offset, activeLabel = GetOffset(t)
@@ -1387,12 +1905,14 @@ SlashCmdList["LOCALCLOCK"] = function(message)
                 Print("time zone set to " .. zones[zoneArg].label .. ".")
             end
         else
-            Print("unknown zone. Options: eastern, central, mountain, pacific, alaska, arizona, hawaii, utc, cet, eet.")
+            Print("unknown zone. Options: local, eastern, central, mountain, pacific, alaska, arizona, hawaii, utc, cet, eet.")
             Print("example: /clock zone eet (automatically switches between EET and EEST)")
         end
     elseif command == "zone" then
-        local current = LocalClockDB.zone or "eastern"
-        if current == "custom" then
+        local current = LocalClockDB.zone or "local"
+        if current == "local" then
+            Print("current zone: Game Local Time (device clock; game-language format by default).")
+        elseif current == "custom" then
             Print("current zone: " .. OffsetLabel(LocalClockDB.customOffset or 0) .. " (set with the slider or /clock offset).")
         elseif zones[current] and zones[current].eu then
             local ok, t = pcall(date, "*t")
@@ -1408,7 +1928,7 @@ SlashCmdList["LOCALCLOCK"] = function(message)
         else
             Print("current zone: " .. (zones[current] and zones[current].label or "Eastern") .. ".")
         end
-        Print("set with /clock zone eastern, central, mountain, pacific, alaska, arizona, hawaii, utc, cet, or eet.")
+        Print("set with /clock zone local, eastern, central, mountain, pacific, alaska, arizona, hawaii, utc, cet, or eet.")
     elseif command == "options" or command == "config" then
         CreatePanel()
         panel:Show()
@@ -1428,6 +1948,8 @@ SlashCmdList["LOCALCLOCK"] = function(message)
         LocalClockDB.locked = false
         Print("position unlocked.")
     elseif command == "reset" then
+        LocalClockDB.minimapButtonAngle = 45
+        UpdateMinimapButtonPosition()
         LocalClockDB.point = nil
         LocalClockDB.relativePoint = nil
         LocalClockDB.x = nil
@@ -1464,12 +1986,28 @@ SlashCmdList["LOCALCLOCK"] = function(message)
             local h, m = GetGameTime()
             Print("GetGameTime (realm): " .. tostring(h) .. ":" .. tostring(m))
         end
+        Print("localClock API: AZS_GetLocalTime=" .. type(AZS_GetLocalTime) ..
+            ", AZS_SetHudShown=" .. type(AZS_SetHudShown) ..
+            ", AZS_IsHudShown=" .. type(AZS_IsHudShown))
+        if type(AZS_IsHudShown) == "function" then
+            local apiOK, apiValue = pcall(AZS_IsHudShown, "localClock")
+            Print("AZS_IsHudShown(localClock): " ..
+                (apiOK and tostring(apiValue) or "call failed: " .. tostring(apiValue)))
+        end
+        if type(GetCVar) == "function" then
+            local cvarOK, cvarValue = pcall(GetCVar, "hudLocalClock")
+            Print("hudLocalClock CVar: " ..
+                (cvarOK and tostring(cvarValue) or "unavailable: " .. tostring(cvarValue)))
+        else
+            Print("hudLocalClock CVar: GetCVar unavailable")
+        end
     else
-        Print("right-click the clock for settings; with Move UI, LocalClock is independently movable and follows the minimap position/scale.")
+        Print("Use the minimap bubble: left-click for tools, right-click for settings, Shift-drag to reposition it.")
+        Print("Show Game Clock controls the native minimap clock; Show LocalClock controls the secondary display.")
         Print("commands: /clock options, tools, mode clock|stopwatch|alarm, show, hide, toggle, 12h, 24h, lock, unlock, reset, debug")
         Print("stopwatch: /clock stopwatch start|pause|reset")
         Print("alarm: /clock alarm set HH:MM, /clock alarm cancel")
-        Print("time zones: /clock zone eastern, central, mountain, pacific, alaska, arizona, hawaii, utc, cet, eet")
+        Print("time zones: /clock zone local, eastern, central, mountain, pacific, alaska, arizona, hawaii, utc, cet, eet")
         Print("US and EU daylight-saving transitions are calculated automatically for zones that observe them.")
     end
 end
@@ -1478,8 +2016,24 @@ local loader = CreateFrame("Frame")
 loader:RegisterEvent("PLAYER_LOGIN")
 loader:SetScript("OnEvent", function()
     if not LocalClockDB then LocalClockDB = {} end
-    if LocalClockDB.use12Hour == nil then LocalClockDB.use12Hour = true end
-    if LocalClockDB.zone == nil then LocalClockDB.zone = "eastern" end
+    local initialLocalTime = ReadGameLocalTime()
+    if LocalClockDB.use12Hour == nil then
+        if initialLocalTime then
+            LocalClockDB.use12Hour = not initialLocalTime.is24Hour
+        else
+            LocalClockDB.use12Hour = true
+        end
+    end
+    if LocalClockDB.zone == nil then
+        if type(AZS_GetLocalTime) == "function" then
+            LocalClockDB.zone = "local"
+        else
+            -- Preserve the historical first-install behavior on pre-0.136.0 clients.
+            LocalClockDB.zone = "eastern"
+        end
+    end
+    if LocalClockDB.localFormat == nil then LocalClockDB.localFormat = "game" end
+    if LocalClockDB.minimapButtonAngle == nil then LocalClockDB.minimapButtonAngle = 45 end
     if LocalClockDB.shown == nil then LocalClockDB.shown = true end
     if LocalClockDB.displayMode == nil then LocalClockDB.displayMode = "clock" end
     stopwatchElapsed = tonumber(LocalClockDB.stopwatchElapsed) or 0
@@ -1493,6 +2047,7 @@ loader:SetScript("OnEvent", function()
         LocalClockDB.alarmMinute = nil
     end
     shown = LocalClockDB.shown and true or false
+    gameClockShown = GetGameClockShown()
     CreateClock()
     CreateAlarmWarningFrame()
 end)

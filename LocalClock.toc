@@ -1,8 +1,8 @@
 ## Interface: 11200
 ## Title: LocalClock
-## Notes: Dual clock with independently movable clock, stopwatch, and alarm countdown modes.
+## Notes: Game-local time integration, minimap launcher, stopwatch, and alarms.
 ## Author: JamieLinux
-## Version: 1.3.3
+## Version: 1.3.2
 ## SavedVariables: LocalClockDB
 
 LocalClock.lua
