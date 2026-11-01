@@ -1,6 +1,5 @@
 # LocalClock for Azeroth Survivors
 
-**Version:** 1.0.5  
 **Client:** Legacy Azeroth Survivors (Interface 11200 / Lua 5.0-style API)
 
 LocalClock adds a small, movable on-screen clock that displays time converted from the game's UTC clock into a selected time zone. The colon blinks every half-second.
