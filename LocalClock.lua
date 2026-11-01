@@ -1274,14 +1274,34 @@ end
 
 -- Classic addon bubble attached to the minimap. The whole button is one
 -- named frame: its artwork, hit area, tooltip and click behavior move together.
+local function IsSquareMinimap()
+    if not IsAddOnLoaded then return false end
+    local ok, loaded = pcall(IsAddOnLoaded, "SurvivorsDragonUi")
+    return ok and loaded and true or false
+end
+
 local function UpdateMinimapButtonPosition()
     if not minimapButton or not Minimap then return end
     local angle = tonumber(LocalClockDB and LocalClockDB.minimapButtonAngle) or 45
-    local radius = (Minimap:GetWidth() * 0.5) + 8
     local radians = math.rad(angle)
+    local c, s = math.cos(radians), math.sin(radians)
+    local half = (Minimap:GetWidth() or 140) / 2
+    local x, y
+
+    if IsSquareMinimap() then
+        -- Follow Azerloot's square-map path: place the button just outside
+        -- the square border rather than on a circular orbit.
+        local radius = half + 6
+        local divisor = math.max(math.abs(c), math.abs(s))
+        x, y = c * radius / divisor, s * radius / divisor
+    else
+        -- Match the classic round-minimap button spacing used by Azerloot.
+        local radius = half + 10
+        x, y = c * radius, s * radius
+    end
+
     minimapButton:ClearAllPoints()
-    minimapButton:SetPoint("CENTER", Minimap, "CENTER",
-        math.cos(radians) * radius, math.sin(radians) * radius)
+    minimapButton:SetPoint("CENTER", Minimap, "CENTER", x, y)
 end
 
 local function SaveMinimapButtonAngle()
@@ -1299,42 +1319,54 @@ end
 
 local function CreateMinimapButton()
     if minimapButton or not Minimap then return end
+
     minimapButton = CreateFrame("Button", "LocalClockMinimapButton", Minimap)
-    minimapButton:SetWidth(32)
-    minimapButton:SetHeight(32)
+    minimapButton:SetWidth(31)
+    minimapButton:SetHeight(31)
     minimapButton:SetFrameStrata("MEDIUM")
     if minimapButton.SetFrameLevel and Minimap.GetFrameLevel then
         minimapButton:SetFrameLevel(Minimap:GetFrameLevel() + 8)
     end
-    minimapButton:SetMovable(true)
     minimapButton:EnableMouse(true)
     minimapButton:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     minimapButton:RegisterForDrag("LeftButton")
-    -- A single self-contained circular button graphic. The gold ring and
-    -- clock face are part of the same alpha-masked texture, so there is no
-    -- separate minimap background or offset tracking-border layer to misalign.
+
+    -- Classic WoW minimap-button composition, matching Azerloot:
+    -- a small round icon inside Blizzard's own tracking-border texture.
     local icon = minimapButton:CreateTexture(nil, "ARTWORK")
     icon:SetTexture("Interface\\AddOns\\LocalClock\\Textures\\LocalClockButton.tga")
-    icon:SetWidth(30)
-    icon:SetHeight(30)
-    icon:SetPoint("CENTER", minimapButton, "CENTER", 0, 0)
+    icon:SetWidth(21)
+    icon:SetHeight(21)
+    icon:SetPoint("CENTER", minimapButton, "CENTER", 0, 1)
+
+    local border = minimapButton:CreateTexture(nil, "OVERLAY")
+    border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+    border:SetWidth(53)
+    border:SetHeight(53)
+    border:SetPoint("TOPLEFT", minimapButton, "TOPLEFT", 0, 0)
+
+    minimapButton:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
 
     minimapButton:SetScript("OnEnter", function()
         if not GameTooltip then return end
         GameTooltip:SetOwner(minimapButton, "ANCHOR_LEFT")
         GameTooltip:SetText("LocalClock")
-        GameTooltip:AddLine("Left-click: Clock tools", 1, 1, 1)
+        GameTooltip:AddLine("Click: Clock tools", 1, 1, 1)
         GameTooltip:AddLine("Right-click: Clock settings", 1, 1, 1)
-        GameTooltip:AddLine("Shift-drag: Move button around minimap", 0.75, 0.75, 0.75)
+        GameTooltip:AddLine("Drag: Move around the minimap", 0.75, 0.75, 0.75)
         GameTooltip:Show()
     end)
     minimapButton:SetScript("OnLeave", function()
         if GameTooltip then GameTooltip:Hide() end
     end)
+
     minimapButton:SetScript("OnMouseDown", function()
-        -- A new press starts a fresh click/drag gesture.
-        if not minimapButton.isDragging then minimapButton.draggedForClick = nil end
+        -- Clear the previous gesture state before a fresh click or drag.
+        if not minimapButton.isDragging then
+            minimapButton.draggedForClick = nil
+        end
     end)
+
     minimapButton:SetScript("OnClick", function()
         if minimapButton.draggedForClick then
             minimapButton.draggedForClick = nil
@@ -1347,19 +1379,44 @@ local function CreateMinimapButton()
             toolsPanel:Show()
         end
     end)
+
+    -- Use ordinary left-button dragging, as Azerloot does. The button follows
+    -- the cursor around the minimap edge; no Shift key or StartMoving offset.
     minimapButton:SetScript("OnDragStart", function()
-        -- Shift-drag is reserved for placement so an ordinary left-click
-        -- continues to open the tools panel.
-        if IsShiftKeyDown and IsShiftKeyDown() then
+        if not minimapButton.isDragging then
+            if GameTooltip then GameTooltip:Hide() end
             minimapButton.isDragging = true
             minimapButton.draggedForClick = true
-            minimapButton:StartMoving()
         end
     end)
+
+    minimapButton:SetScript("OnUpdate", function()
+        if not minimapButton.isDragging then return end
+        local cursorX, cursorY = GetCursorPosition()
+        local scale = Minimap:GetEffectiveScale()
+        local centerX, centerY = Minimap:GetCenter()
+        if not cursorX or not cursorY or not scale or scale <= 0 or not centerX or not centerY then
+            return
+        end
+
+        local dx = cursorX / scale - centerX
+        local dy = cursorY / scale - centerY
+        local atan2 = math.atan2 or math.atan
+        local angle = math.deg(atan2(dy, dx))
+        if angle < 0 then angle = angle + 360 end
+
+        if LocalClockDB then
+            LocalClockDB.minimapButtonAngle = angle
+            LocalClockDB.minimapButtonMoved = true
+        end
+        UpdateMinimapButtonPosition()
+    end)
+
     minimapButton:SetScript("OnDragStop", function()
         if minimapButton.isDragging then
-            minimapButton:StopMovingOrSizing()
             minimapButton.isDragging = nil
+            -- Store the actual final button-center angle, not the cursor's
+            -- grab offset, to avoid a small snap when the drag is released.
             SaveMinimapButtonAngle()
         end
     end)

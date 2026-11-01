@@ -12,7 +12,7 @@ The LocalClock bubble follows the minimap's position, scale, and visibility. It 
 - **Left-click:** Open the LocalClock tools panel. Its position is saved independently when moved and restored on later runs.
 - **Settings menu:** Separate Clock, Stopwatch and Alarm entries open the tools panel in the corresponding mode.
 - **Right-click:** Open LocalClock settings.
-- **Shift-drag:** Move the bubble around the minimap.
+- **Drag:** Move the bubble around the minimap, following the classic Azerloot-style edge path. Shift is not required.
 
 The launcher remains independently usable without Move UI. The secondary clock and alarm warning retain their existing Move UI handoff.
 

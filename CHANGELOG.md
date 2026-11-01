@@ -1,4 +1,7 @@
 ## 1.1.2 — Game Local Time integration and UI improvements
+- Test iteration: switched the LocalClock launcher to the classic Azeroth Survivors minimap-button composition used by Azerloot: Blizzard tracking border/highlight with a centered circular clock icon.
+- Launcher now follows the minimap edge with ordinary left-button drag; Shift is no longer required. A normal click still opens Clock tools, right-click still opens settings, and release preserves the final angular position.
+- Added the same round/square minimap path handling used by Azerloot, including SurvivorsDragonUi square-map support.
 - Test iteration: removed the runtime feature-detection gate that greyed out Show Game Clock; the menu now always lets the player invoke the guarded `localClock` API/CVar path.
 - Fixed native clock state normalization so a real `false` from `AZS_IsHudShown("localClock")` or `hudLocalClock` is preserved rather than discarded by Lua's `and/or` idiom.
 - Extended `/clock debug` with the types/results of `AZS_GetLocalTime`, `AZS_SetHudShown`, `AZS_IsHudShown`, `AZS_IsHudShown("localClock")` and the `hudLocalClock` CVar.
