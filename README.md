@@ -1,6 +1,6 @@
 # LocalClock for Azeroth Survivors
 
-**Version:** 1.3.2  
+**Version:** 1.1.2  
 **Client:** Legacy Azeroth Survivors (Interface 11200 / Lua 5.0-style API)
 
 LocalClock adds a movable secondary clock, a classic minimap launcher, and stopwatch/alarm tools. On Azeroth Survivors 0.136.0 or newer, it can read the game's device-local time and independently control the native local clock below the minimap.
