@@ -1,4 +1,4 @@
--- LocalClock 1.3.2 for the legacy Azeroth Survivors client (Lua 5.0 style).
+-- LocalClock 1.1.2 for the legacy Azeroth Survivors client (Lua 5.0 style).
 -- Uses the game's device-local clock API where available; named/custom zones
 -- retain the UTC-based conversion engine and US/EU daylight-saving rules.
 

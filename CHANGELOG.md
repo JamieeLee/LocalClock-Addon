@@ -1,4 +1,4 @@
-## 1.3.2 — current menu and minimap-button fixes
+## 1.1.2 — Game Local Time integration and UI improvements
 - Test iteration: removed the runtime feature-detection gate that greyed out Show Game Clock; the menu now always lets the player invoke the guarded `localClock` API/CVar path.
 - Fixed native clock state normalization so a real `false` from `AZS_IsHudShown("localClock")` or `hudLocalClock` is preserved rather than discarded by Lua's `and/or` idiom.
 - Extended `/clock debug` with the types/results of `AZS_GetLocalTime`, `AZS_SetHudShown`, `AZS_IsHudShown`, `AZS_IsHudShown("localClock")` and the `hudLocalClock` CVar.

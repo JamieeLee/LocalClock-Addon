@@ -2,7 +2,7 @@
 ## Title: LocalClock
 ## Notes: Game-local time integration, minimap launcher, stopwatch, and alarms.
 ## Author: JamieLinux
-## Version: 1.3.2
+## Version: 1.1.2
 ## SavedVariables: LocalClockDB
 
 LocalClock.lua
