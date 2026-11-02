@@ -1,9 +1,10 @@
 # LocalClock for Azeroth Survivors
 
-**Version:** 1.1.2
+**Version:** 1.1.3-RC
+**Status:** Release candidate — optional test update.
 **Client:** Legacy Azeroth Survivors (Interface 11200 / Lua 5.0-style API)
 
-LocalClock adds a movable secondary clock, a classic minimap launcher, and stopwatch/alarm tools. On Azeroth Survivors 0.136.0 or newer, it can read the game's device-local time and independently control the native local clock below the minimap.
+LocalClock adds a movable secondary clock, a classic minimap launcher, and stopwatch/alarm tools. On Azeroth Survivors 0.136.0 or newer, it reads the device-local hour/minute snapshot to determine the device UTC offset, then calculates the displayed time from an explicit UTC source. It can also independently control the native local clock below the minimap.
 
 ## Minimap launcher
 
@@ -18,7 +19,7 @@ The launcher remains independently usable without Move UI. The secondary clock a
 
 ## Game Local Time and clock visibility
 
-On Azeroth Survivors 0.136.0 or newer, a fresh LocalClock installation defaults to **Game Local Time**, using `AZS_GetLocalTime()` and the game's language-specific time format. The native minimap clock can be hidden separately through `AZS_SetHudShown("localClock", false)`.
+On Azeroth Survivors 0.136.0 or newer, a fresh LocalClock installation defaults to **Game Local Time**. It uses the API's numeric local hour/minute snapshot to derive the device offset from UTC, then calculates the displayed time through LocalClock's own UTC conversion engine. The game's `is24Hour` field controls the default 12/24-hour presentation; the API's preformatted text is not displayed directly. The native minimap clock can be hidden separately through `AZS_SetHudShown("localClock", false)`.
 
 The right-click menu has two independent checkboxes:
 
@@ -29,7 +30,7 @@ The two options are independent. Hiding the minimap hides both clock displays an
 
 Existing saved time-zone choices are preserved during the update. If a previous installation already saved Eastern, CET, a custom offset, or another zone, LocalClock keeps it. Choose **Game Local Time** in the Time zone submenu to use the device-local clock instead.
 
-The native Game Clock checkbox is available only when the client exposes the getter and HUD visibility functions. Older game builds retain the legacy time-zone fallback and do not receive unknown API calls.
+The native Game Clock checkbox uses the `localClock` HUD setter when available, with the documented `hudLocalClock` CVar as a fallback. Older game builds without either control retain the legacy time-zone fallback and do not receive unknown API calls.
 
 ## Time-zone settings
 
@@ -37,7 +38,7 @@ Right-click the LocalClock bubble (or the secondary clock) and choose **Time zon
 
 Supported named zones include Eastern, Central, Mountain, Pacific, Alaska, Hawaii, Arizona, UTC, CET/CEST, and EET/EEST. US and EU daylight-saving transitions are calculated for the corresponding named zones. A custom UTC offset is also available from the slider.
 
-When Game Local Time is selected, the default format follows the game language. The 12-hour and 24-hour controls allow an explicit display override. When using Game Local Time, 24-hour mode converts 12-hour API values to 00–23 time rather than merely hiding the AM/PM suffix. Selecting another time zone continues to use LocalClock's existing zone conversion engine.
+When Game Local Time is selected, the default format follows the game language using the API's `is24Hour` flag. The 12-hour and 24-hour controls allow an explicit display override. All clock arithmetic starts from UTC; Game Local Time derives the device offset from the numeric local snapshot, while named zones continue using LocalClock's existing UTC/DST conversion engine.
 
 ## Stopwatch and alarms
 

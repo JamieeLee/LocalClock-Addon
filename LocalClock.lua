@@ -1,4 +1,4 @@
--- LocalClock 1.1.2 for the legacy Azeroth Survivors client (Lua 5.0 style).
+-- LocalClock 1.1.3-RC for the legacy Azeroth Survivors client (Lua 5.0 style).
 -- Uses the game's device-local clock API where available; named/custom zones
 -- retain the UTC-based conversion engine and US/EU daylight-saving rules.
 
@@ -68,7 +68,7 @@ local function DaysInMonth(year, month)
     return 31
 end
 
-local function FirstSunday(year, month, current)
+local function FirstSunday(current)
     -- date("*t").wday follows standard Lua convention: Sunday = 1.
     -- Derive the weekday of the first of the month from today's weekday.
     local firstWday = current.wday - (current.day - 1)
@@ -77,7 +77,7 @@ local function FirstSunday(year, month, current)
     return 1 + Mod(1 - firstWday, 7)
 end
 
-local function LastSunday(year, month, current)
+local function LastSunday(month, current)
     -- Compute the last Sunday of the month using the current UTC date's
     -- weekday. This avoids os.time/os.date, which this client does not expose.
     local firstWday = current.wday - (current.day - 1)
@@ -94,14 +94,14 @@ local function IsUSDaylightTime(t, standardOffset)
     if t.month > 3 and t.month < 11 then return true end
 
     if t.month == 3 then
-        local first = FirstSunday(t.year, 3, t)
+        local first = FirstSunday(t)
         local second = first + 7
         if t.day > second then return true end
         if t.day < second then return false end
         local transitionHour = 2 - (standardOffset or -5)
         return t.hour >= transitionHour -- 02:00 local standard time
     end
-    local first = FirstSunday(t.year, 11, t)
+    local first = FirstSunday(t)
     if t.day < first then return true end
     if t.day > first then return false end
     local transitionHour = 2 - ((standardOffset or -5) + 1)
@@ -114,70 +114,49 @@ local function IsEuropeanDaylightTime(t)
     if t.month > 3 and t.month < 10 then return true end
 
     if t.month == 3 then
-        local last = LastSunday(t.year, 3, t)
+        local last = LastSunday(3, t)
         if t.day < last then return false end
         if t.day > last then return true end
         return t.hour >= 1 -- EU summer time starts at 01:00 UTC
     end
 
-    local last = LastSunday(t.year, 10, t)
+    local last = LastSunday(10, t)
     if t.day < last then return true end
     if t.day > last then return false end
     return t.hour < 1 -- EU summer time ends at 01:00 UTC
 end
 
--- Azeroth Survivors 0.136.0 exposes the same device-local clock used by
--- the native minimap widget. Read it as a snapshot; never infer the device
--- time zone from the realm clock or the UTC date API.
+-- Azeroth Survivors 0.136.0 exposes a device-local time snapshot. Use its
+-- numeric fields to determine the current device offset relative to UTC;
+-- all clock arithmetic and display conversion remain anchored to UTC.
 local function ReadGameLocalTime()
     if type(AZS_GetLocalTime) ~= "function" then return nil end
-    -- Support both the table snapshot and four-value Lua return shape. The
-    -- public changelog describes the returned fields but not their container.
-    local ok, first, second, third, fourth = pcall(AZS_GetLocalTime)
-    if not ok then return nil end
+    local ok, reading = pcall(AZS_GetLocalTime)
+    if not ok or type(reading) ~= "table" then return nil end
 
-    local reading
-    if type(first) == "table" then
-        reading = first
-    elseif type(first) == "string" then
-        reading = {
-            text = first,
-            hour = second,
-            minute = third,
-            is24Hour = fourth
-        }
-    else
+    local hour, minute = reading.hour, reading.minute
+    if type(reading.text) ~= "string" or reading.text == "" or
+        type(hour) ~= "number" or type(minute) ~= "number" or
+        type(reading.is24Hour) ~= "boolean" then
+        return nil
+    end
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59 or
+        hour ~= math.floor(hour) or minute ~= math.floor(minute) then
         return nil
     end
 
-    -- The changelog describes a format value without pinning its Lua type.
-    -- Accept the documented boolean as well as common textual format labels.
-    local formatValue = reading.is24Hour
-    if formatValue == nil then formatValue = reading.format end
-    if type(formatValue) == "string" then
-        local normalized = string.lower(formatValue)
-        if normalized == "24" or normalized == "24h" or normalized == "24-hour" or normalized == "24hour" then
-            formatValue = true
-        elseif normalized == "12" or normalized == "12h" or normalized == "12-hour" or normalized == "12hour" then
-            formatValue = false
-        else
-            return nil
-        end
-    end
-
-    if type(reading.text) ~= "string" or type(reading.hour) ~= "number" or
-        type(reading.minute) ~= "number" or type(formatValue) ~= "boolean" then
-        return nil
-    end
-    if reading.hour < 0 or reading.hour > 23 or reading.minute < 0 or reading.minute > 59 then
-        return nil
-    end
+    -- Keep a small detached snapshot; never retain the API's mutable table.
     return {
         text = reading.text,
-        hour = reading.hour,
-        minute = reading.minute,
-        is24Hour = formatValue
+        hour = hour,
+        minute = minute,
+        is24Hour = reading.is24Hour
     }
+end
+
+local function GetGameLocalHour24(reading)
+    -- The API contract supplies 0-23 regardless of the display format.
+    return reading and reading.hour or 0
 end
 
 local function NormalizeGameClockShown(value)
@@ -186,12 +165,32 @@ local function NormalizeGameClockShown(value)
     return nil
 end
 
-local function GetOffset(t)
+local function GetDeviceLocalOffset(t, reading)
+    if not reading then reading = ReadGameLocalTime() end
+    if not reading then return nil end
+
+    -- Compare the device-local numeric time with the UTC snapshot. Round to
+    -- 15-minute zone increments to absorb a minute rollover between reads.
+    local utcMinutes = (t.hour * 60) + (t.min or 0)
+    local localMinutes = (GetGameLocalHour24(reading) * 60) + reading.minute
+    local offsetMinutes = localMinutes - utcMinutes
+    while offsetMinutes < -720 do offsetMinutes = offsetMinutes + 1440 end
+    while offsetMinutes > 840 do offsetMinutes = offsetMinutes - 1440 end
+    if offsetMinutes >= 0 then
+        offsetMinutes = math.floor((offsetMinutes + 7.5) / 15) * 15
+    else
+        offsetMinutes = -math.floor((-offsetMinutes + 7.5) / 15) * 15
+    end
+    return offsetMinutes / 60
+end
+
+local function GetOffset(t, localReading)
     local zoneName = "eastern"
     if LocalClockDB and LocalClockDB.zone then zoneName = LocalClockDB.zone end
     if zoneName == "local" then
-        if ReadGameLocalTime() then return 0, "Device Local Time" end
-        -- Older clients without the getter retain the previous Eastern fallback.
+        local offset = GetDeviceLocalOffset(t, localReading)
+        if offset ~= nil then return offset, "Game Local Time" end
+        -- Older clients or the first frame after reload retain Eastern fallback.
         zoneName = "eastern"
     end
     if zoneName == "custom" then
@@ -218,13 +217,13 @@ end
 
 local function ShiftDate(t, offset)
     local year, month, day = t.year, t.month, t.day
-    local hour = t.hour + offset
-    while hour < 0 do
-        hour = hour + 24
+    local totalMinutes = (t.hour * 60) + (t.min or 0) + math.floor((offset * 60) + 0.5)
+    while totalMinutes < 0 do
+        totalMinutes = totalMinutes + 1440
         day = day - 1
     end
-    while hour >= 24 do
-        hour = hour - 24
+    while totalMinutes >= 1440 do
+        totalMinutes = totalMinutes - 1440
         day = day + 1
     end
     while day < 1 do
@@ -237,76 +236,42 @@ local function ShiftDate(t, offset)
         month = month + 1
         if month > 12 then month = 1; year = year + 1 end
     end
-    return year, month, day, hour
+    local hour = math.floor(totalMinutes / 60)
+    local minute = totalMinutes - (hour * 60)
+    return year, month, day, hour, minute
 end
 
-local function GetGameLocalHour24(reading)
-    if not reading then return 0 end
-    local hour = reading.hour or 0
-
-    -- A 24-hour source is already normalized. Some clients may expose a
-    -- 12-hour numeric hour (1-12) alongside a formatted string such as
-    -- "1:41 PM"; convert that numeric value when the user requests 24-hour.
-    if reading.is24Hour then return hour end
-
-    local text = string.lower(reading.text or "")
-    local isPM = string.find(text, "p%.?m%.?")
-    local isAM = string.find(text, "a%.?m%.?")
-
-    if isPM then
-        if hour < 12 then hour = hour + 12 end
-    elseif isAM then
-        if hour == 12 then hour = 0 end
-    end
-
-    -- If the API already returned 13-23 despite using a 12-hour display
-    -- string, leave it untouched. This also safely handles clients whose
-    -- numeric hour is already 24-hour even when their text is localized.
-    return hour
-end
-
-local function GetClockText()
-    local zoneName = LocalClockDB and LocalClockDB.zone or "eastern"
-
-    if zoneName == "local" then
-        local reading = ReadGameLocalTime()
-        if reading then
-            local formatMode = LocalClockDB and LocalClockDB.localFormat or "game"
-            if formatMode == "game" then
-                -- Use the game's exact language-aware string (English 12h,
-                -- other localized formats 24h) without reformatting it.
-                return reading.text
-            end
-
-            local hour = reading.hour
-            local minute = reading.minute
-            local colon = colonVisible and ":" or " "
-            if formatMode == "12h" then
-                local hour24 = GetGameLocalHour24(reading)
-                local suffix = (hour24 >= 12) and "PM" or "AM"
-                hour = Mod(hour24, 12)
-                if hour == 0 then hour = 12 end
-                return string.format("%d%s%02d %s", hour, colon, minute, suffix)
-            end
-            hour = GetGameLocalHour24(reading)
-            return string.format("%02d%s%02d", hour, colon, minute)
-        end
-        -- If the API is temporarily unavailable, preserve a usable clock.
-        -- GetOffset() supplies the legacy Eastern fallback in that case.
-    end
-
+local function GetClockText(utcTable, localReading)
     if not date then return "-- -- --" end
-    local ok, t = pcall(date, "*t")
-    if not ok or type(t) ~= "table" or not t.hour or not t.min then return "-- -- --" end
+    local t = utcTable
+    if not t then
+        local ok
+        ok, t = pcall(date, "!*t")
+        if not ok or type(t) ~= "table" or not t.hour or not t.min then return "-- -- --" end
+    end
 
-    local offset = GetOffset(t)
-    local year, month, day, hour = ShiftDate(t, offset)
-    local minute = t.min
-    local colon = ":"
-    if not colonVisible then colon = " " end
-    if LocalClockDB and LocalClockDB.use12Hour then
-        local suffix = "AM"
-        if hour >= 12 then suffix = "PM" end
+    local zoneName = LocalClockDB and LocalClockDB.zone or "eastern"
+    if zoneName == "local" then
+        localReading = localReading or ReadGameLocalTime()
+    end
+    local offset = GetOffset(t, localReading)
+    local _, _, _, hour, minute = ShiftDate(t, offset)
+    local colon = colonVisible and ":" or " "
+
+    local use12Hour = LocalClockDB and LocalClockDB.use12Hour and true or false
+    if zoneName == "local" then
+        local formatMode = LocalClockDB and LocalClockDB.localFormat or "game"
+        if formatMode == "12h" then
+            use12Hour = true
+        elseif formatMode == "24h" then
+            use12Hour = false
+        elseif localReading then
+            use12Hour = not localReading.is24Hour
+        end
+    end
+
+    if use12Hour then
+        local suffix = (hour >= 12) and "PM" or "AM"
         hour = Mod(hour, 12)
         if hour == 0 then hour = 12 end
         return string.format("%d%s%02d %s", hour, colon, minute, suffix)
@@ -314,13 +279,13 @@ local function GetClockText()
     return string.format("%02d%s%02d", hour, colon, minute)
 end
 
-local function IsClockUsing12Hour()
+local function IsClockUsing12Hour(localReading)
     if LocalClockDB and LocalClockDB.zone == "local" then
         local formatMode = LocalClockDB.localFormat or "game"
         if formatMode == "12h" then return true end
         if formatMode == "24h" then return false end
-        local reading = ReadGameLocalTime()
-        if reading then return not reading.is24Hour end
+        localReading = localReading or ReadGameLocalTime()
+        if localReading then return not localReading.is24Hour end
     end
     return LocalClockDB and LocalClockDB.use12Hour and true or false
 end
@@ -337,9 +302,9 @@ local function GetUtcTable(timestamp)
     if not date then return nil end
     local ok, t
     if timestamp then
-        ok, t = pcall(date, "*t", timestamp)
+        ok, t = pcall(date, "!*t", timestamp)
     else
-        ok, t = pcall(date, "*t")
+        ok, t = pcall(date, "!*t")
     end
     if not ok or type(t) ~= "table" or not t.hour or not t.min then return nil end
     return t
@@ -362,7 +327,7 @@ local function ComputeAlarmTimestamp(hour, minute)
     if LocalClockDB and LocalClockDB.zone == "local" then
         local reading = ReadGameLocalTime()
         if reading then
-            local localNow = (reading.hour * 3600) + (reading.minute * 60) + (utcNow.sec or 0)
+            local localNow = (GetGameLocalHour24(reading) * 3600) + (reading.minute * 60) + (utcNow.sec or 0)
             local targetLocal = (hour * 3600) + (minute * 60)
             wallDelta = targetLocal - localNow
             if wallDelta <= 0 then wallDelta = wallDelta + 86400 end
@@ -372,8 +337,8 @@ local function ComputeAlarmTimestamp(hour, minute)
 
     -- Named/custom time zones continue using LocalClock's existing UTC/DST engine.
     local currentOffset = GetOffset(utcNow)
-    local _, _, _, localHour = ShiftDate(utcNow, currentOffset)
-    local localNow = (localHour * 3600) + ((utcNow.min or 0) * 60) + (utcNow.sec or 0)
+    local _, _, _, localHour, localMinute = ShiftDate(utcNow, currentOffset)
+    local localNow = (localHour * 3600) + (localMinute * 60) + (utcNow.sec or 0)
     local targetLocal = (hour * 3600) + (minute * 60)
     wallDelta = targetLocal - localNow
     if wallDelta <= 0 then wallDelta = wallDelta + 86400 end
@@ -422,7 +387,6 @@ local function SetDisplayMode(mode)
     if not LocalClockDB then LocalClockDB = {} end
     LocalClockDB.displayMode = mode
     UpdateClock()
-    if UpdateToolsPanel then UpdateToolsPanel() end
 end
 
 local function SetStopwatchRunning(running)
@@ -432,8 +396,6 @@ local function SetStopwatchRunning(running)
         LocalClockDB.stopwatchRunning = stopwatchRunning
     end
     SetDisplayMode("stopwatch")
-    if UpdateToolsPanel then UpdateToolsPanel() end
-    if label then UpdateClock() end
 end
 
 local function ResetStopwatch()
@@ -462,7 +424,6 @@ local function SetAlarmAt(hour, minute)
     LocalClockDB.alarmTimestamp = timestamp
     LocalClockDB.alarmFired = false
     SetDisplayMode("alarm")
-    if UpdateToolsPanel then UpdateToolsPanel() end
     return true
 end
 
@@ -473,8 +434,7 @@ local function CancelAlarm()
         LocalClockDB.alarmMinute = nil
         LocalClockDB.alarmFired = false
     end
-    if UpdateToolsPanel then UpdateToolsPanel() end
-    if label then UpdateClock() end
+    UpdateClock()
 end
 
 local function DismissAlarm()
@@ -488,8 +448,7 @@ local function DismissAlarm()
     if LocalClockDB and LocalClockDB.displayMode == "alarm" then
         LocalClockDB.displayMode = "clock"
     end
-    if UpdateToolsPanel then UpdateToolsPanel() end
-    if label then UpdateClock() end
+    UpdateClock()
 end
 
 local function CreateAlarmWarningFrame()
@@ -560,8 +519,7 @@ local function CheckAlarm()
         elseif PlaySound then
             pcall(PlaySound, "igMainMenuOpen")
         end
-        if UpdateToolsPanel then UpdateToolsPanel() end
-        if label then UpdateClock() end
+        UpdateClock()
     end
 end
 
@@ -1035,7 +993,9 @@ local function StartWatcher()
         if utilityElapsed >= 0.25 then
             utilityElapsed = utilityElapsed - 0.25
             CheckAlarm()
-            if toolsPanel and toolsPanel:IsShown() then UpdateToolsPanel() end
+            if toolsPanel and toolsPanel:IsShown() and (not frame or not frame:IsShown()) then
+                UpdateToolsPanel()
+            end
         end
         if watcherElapsed >= 0.5 then
             watcherElapsed = watcherElapsed - 0.5
@@ -1407,7 +1367,6 @@ local function CreateMinimapButton()
 
         if LocalClockDB then
             LocalClockDB.minimapButtonAngle = angle
-            LocalClockDB.minimapButtonMoved = true
         end
         UpdateMinimapButtonPosition()
     end)
@@ -1432,8 +1391,12 @@ local FONT = "Fonts\\FRIZQT__.TTF"
 
 local function OffsetLabel(o)
     if o == 0 then return "UTC" end
-    if o > 0 then return "UTC+" .. o end
-    return "UTC" .. o
+    local sign = o > 0 and "+" or "-"
+    local totalMinutes = math.floor((math.abs(o) * 60) + 0.5)
+    local hours = math.floor(totalMinutes / 60)
+    local minutes = totalMinutes - (hours * 60)
+    if minutes == 0 then return "UTC" .. sign .. tostring(hours) end
+    return string.format("UTC%s%02d:%02d", sign, hours, minutes)
 end
 
 local function MakeTextButton(parent, name, text, size, onClick)
@@ -1467,14 +1430,15 @@ end
 
 UpdatePanel = function()
     if not panel or not panel:IsShown() then return end
-    panelTime:SetText(GetClockText())
-    local ok, t = pcall(date, "*t")
-    if ok and type(t) == "table" then
-        local offset, zoneLabel = GetOffset(t)
-        if LocalClockDB.zone == "local" and ReadGameLocalTime() then
-            panelZone:SetText("Game Local Time  (game-language format)")
-            offset = 0
-        elseif LocalClockDB.zone == "custom" then
+    local t = GetUtcTable()
+    local localReading
+    if LocalClockDB and LocalClockDB.zone == "local" then
+        localReading = ReadGameLocalTime()
+    end
+    if t then
+        panelTime:SetText(GetClockText(t, localReading))
+        local offset, zoneLabel = GetOffset(t, localReading)
+        if LocalClockDB.zone == "custom" then
             panelZone:SetText(OffsetLabel(offset))
         else
             panelZone:SetText(zoneLabel .. "  (" .. OffsetLabel(offset) .. ")")
@@ -1484,9 +1448,11 @@ UpdatePanel = function()
             panelSlider:SetValue(offset)
             syncingSlider = false
         end
+    else
+        panelTime:SetText("-- -- --")
     end
     local c24, c12 = GOLD, GREY
-    if IsClockUsing12Hour() then c24, c12 = GREY, GOLD end
+    if IsClockUsing12Hour(localReading) then c24, c12 = GREY, GOLD end
     panel24.fs:SetTextColor(c24[1], c24[2], c24[3])
     panel12.fs:SetTextColor(c12[1], c12[2], c12[3])
 end
@@ -1794,7 +1760,6 @@ CreateToolsPanel = function()
         else
             Print(err or "Unable to set alarm.")
         end
-        UpdateToolsPanel()
     end)
     alarmSetButton:SetPoint("LEFT", alarmMinuteBox, "RIGHT", 10, 0)
     alarmCancelButton = MakeTextButton(toolsPanel, "LocalClockAlarmCancel", "Cancel", 12, function()
@@ -1803,7 +1768,6 @@ CreateToolsPanel = function()
         else
             CancelAlarm()
         end
-        UpdateToolsPanel()
     end)
     alarmCancelButton:SetPoint("LEFT", alarmSetButton, "RIGHT", 8, 0)
 
@@ -1817,10 +1781,6 @@ CreateToolsPanel = function()
     toolsPanel:Hide()
 end
 
-local function TogglePanel()
-    CreatePanel()
-    if panel:IsShown() then panel:Hide() else panel:Show() end
-end
 
 local function CreateClock()
     if frame then return end
@@ -1949,7 +1909,7 @@ SlashCmdList["LOCALCLOCK"] = function(message)
             if zoneArg == "local" then
                 Print("time zone set to Game Local Time; the game language controls the default 12/24-hour format.")
             elseif zones[zoneArg].eu then
-                local ok, t = pcall(date, "*t")
+                local ok, t = pcall(date, "!*t")
                 if ok and type(t) == "table" then
                     local offset, activeLabel = GetOffset(t)
                     local sign = ""
@@ -1972,7 +1932,7 @@ SlashCmdList["LOCALCLOCK"] = function(message)
         elseif current == "custom" then
             Print("current zone: " .. OffsetLabel(LocalClockDB.customOffset or 0) .. " (set with the slider or /clock offset).")
         elseif zones[current] and zones[current].eu then
-            local ok, t = pcall(date, "*t")
+            local ok, t = pcall(date, "!*t")
             if ok and type(t) == "table" then
                 local offset, activeLabel = GetOffset(t)
                 local sign = ""
@@ -2028,15 +1988,16 @@ SlashCmdList["LOCALCLOCK"] = function(message)
         end
         Print("position reset.")
     elseif command == "debug" then
-        local ok, t = pcall(date, "*t")
+        local ok, t = pcall(date, "!*t")
+        local localReading = ReadGameLocalTime()
         if ok and type(t) == "table" then
-            local offset, zoneLabel = GetOffset(t)
-            Print(string.format("UTC date(*t): %04d-%02d-%02d %02d:%02d:%02d; wday=%s",
+            local offset, zoneLabel = GetOffset(t, localReading)
+            Print(string.format("UTC date(!*t): %04d-%02d-%02d %02d:%02d:%02d; wday=%s",
                 t.year or 0, t.month or 0, t.day or 0,
                 t.hour or 0, t.min or 0, t.sec or 0, tostring(t.wday)))
             Print("selected zone: " .. zoneLabel .. "; applied UTC offset: " .. tostring(offset))
         else
-            Print("date(*t): unavailable or failed")
+            Print("date(!*t): unavailable or failed")
         end
         if time then Print("time() timestamp: " .. tostring(time())) end
         if GetGameTime then
@@ -2046,6 +2007,18 @@ SlashCmdList["LOCALCLOCK"] = function(message)
         Print("localClock API: AZS_GetLocalTime=" .. type(AZS_GetLocalTime) ..
             ", AZS_SetHudShown=" .. type(AZS_SetHudShown) ..
             ", AZS_IsHudShown=" .. type(AZS_IsHudShown))
+        if localReading then
+            Print("device local snapshot: " .. tostring(localReading.text) ..
+                "; hour=" .. tostring(localReading.hour) ..
+                "; minute=" .. tostring(localReading.minute) ..
+                "; is24Hour=" .. tostring(localReading.is24Hour))
+            if ok and type(t) == "table" then
+                local deviceOffset = GetDeviceLocalOffset(t, localReading)
+                Print("device offset from UTC: " .. tostring(deviceOffset) .. " hours")
+            end
+        else
+            Print("device local snapshot: unavailable")
+        end
         if type(AZS_IsHudShown) == "function" then
             local apiOK, apiValue = pcall(AZS_IsHudShown, "localClock")
             Print("AZS_IsHudShown(localClock): " ..
@@ -2059,7 +2032,7 @@ SlashCmdList["LOCALCLOCK"] = function(message)
             Print("hudLocalClock CVar: GetCVar unavailable")
         end
     else
-        Print("Use the minimap bubble: left-click for tools, right-click for settings, Shift-drag to reposition it.")
+        Print("Use the minimap bubble: left-click for tools, right-click for settings, drag to reposition it.")
         Print("Show Game Clock controls the native minimap clock; Show LocalClock controls the secondary display.")
         Print("commands: /clock options, tools, mode clock|stopwatch|alarm, show, hide, toggle, 12h, 24h, lock, unlock, reset, debug")
         Print("stopwatch: /clock stopwatch start|pause|reset")

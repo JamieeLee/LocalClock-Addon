@@ -1,3 +1,18 @@
+## 1.1.3-RC — Maintenance cleanup and refactor
+- Removed duplicate tools-panel refreshes from stopwatch and alarm actions; each state change now routes through the shared clock refresh.
+- Avoided refreshing the tools panel twice as often while the main clock is already visible.
+- Simplified Game Local Time snapshot handling to the documented table contract and retained only a validated detached snapshot.
+- Reused existing UTC/device-time snapshots in the settings panel and debug output.
+- Removed unused UI helper/state and corrected the slash-command help text for ordinary minimap-button dragging.
+- No intended visual, timezone, DST, alarm, stopwatch, minimap-button, or Move UI behavior changes.
+
+## 1.1.2 — UTC-based timezone conversion follow-up (Test 19)
+- Restored UTC as the single source for clock display and alarm calculations, using the explicit `date("!*t")` form.
+- Game Local Time now derives the current device offset from the API's numeric hour/minute snapshot relative to UTC, then uses LocalClock's own date-shift and formatting path.
+- The API's preformatted text is no longer displayed directly, avoiding a second game-side timezone conversion.
+- `/clock debug` now reports the normalized device-local snapshot and the derived UTC offset for easier testing.
+- Named zone and custom offset conversions continue to use the existing UTC/DST calculation engine.
+
 ## 1.1.2 — Game Local Time integration and UI improvements
 - Test iteration: switched the LocalClock launcher to the classic Azeroth Survivors minimap-button composition used by Azerloot: Blizzard tracking border/highlight with a centered circular clock icon.
 - Launcher now follows the minimap edge with ordinary left-button drag; Shift is no longer required. A normal click still opens Clock tools, right-click still opens settings, and release preserves the final angular position.
