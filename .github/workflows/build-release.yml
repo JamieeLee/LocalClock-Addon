@@ -1,0 +1,58 @@
+name: Build and release LocalClock
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "LocalClock.lua"
+      - "LocalClock.toc"
+      - "Textures/**"
+      - ".github/workflows/build-release.yml"
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Assemble and validate installable addon
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/LocalClock
+          cp LocalClock.lua LocalClock.toc dist/LocalClock/
+          cp -R Textures dist/LocalClock/
+          test -f dist/LocalClock/LocalClock.toc
+          test -f dist/LocalClock/LocalClock.lua
+          test -f dist/LocalClock/Textures/LocalClockButton.tga
+          VERSION="$(awk '/^## Version:/ { print $3 }' LocalClock.toc)"
+          VERSION="${VERSION%-dev}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          (cd dist && zip -qr "../LocalClock-$VERSION.zip" LocalClock)
+          unzip -t "LocalClock-$VERSION.zip"
+          unzip -l "LocalClock-$VERSION.zip" | grep -q "LocalClock/LocalClock.toc"
+
+      - name: Upload test build
+        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalClock-${{ env.VERSION }}-test
+          path: LocalClock-${{ env.VERSION }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: LocalClock ${{ github.ref_name }}
+          generate_release_notes: true
+          files: LocalClock-*.zip
